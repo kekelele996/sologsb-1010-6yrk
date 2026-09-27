@@ -202,6 +202,28 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
   return { line: nextLine, issues };
 }
 
+function issueSignature(issue: ProofIssue): string {
+  return `${issue.lineId} ${issue.code} ${issue.ruleId ?? ''} ${issue.severity}`;
+}
+
+function preserveIssueResolution(current: ProjectState, generated: ProofIssue[]): ProofIssue[] {
+  const previousBySignature = new Map<string, ProofIssue[]>();
+
+  current.issues.forEach((item) => {
+    const key = issueSignature(item);
+    previousBySignature.set(key, [...(previousBySignature.get(key) ?? []), item]);
+  });
+
+  const seen = new Map<string, number>();
+  return generated.map((item) => {
+    const key = issueSignature(item);
+    const occurrence = seen.get(key) ?? 0;
+    seen.set(key, occurrence + 1);
+    const previous = previousBySignature.get(key)?.[occurrence];
+    return previous ? { ...item, resolved: previous.resolved } : item;
+  });
+}
+
 export function analyzeProject(state: ProjectState): ProjectState {
   const ruleSet = state.ruleSets.find((item) => item.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const nextLines: TextbookLine[] = [];
@@ -210,7 +232,10 @@ export function analyzeProject(state: ProjectState): ProjectState {
   state.lines.forEach((line, index) => {
     const previousSourceContinues = Boolean(state.lines[index - 1]?.source.trimEnd().endsWith('-'));
     const tokens = transcribeLine(line.source, ruleSet, previousSourceContinues);
-    const analyzed = analyzeLine({ ...line, tokens }, state.lines[index - 1]);
+    const preserveProofing = line.revisionState === 'unchanged' || line.revisionState === 'restored';
+    const status = line.revisionState === 'changed' ? 'questionable' : line.status;
+    const analyzed = analyzeLine({ ...line, tokens, status }, state.lines[index - 1]);
+    if (preserveProofing) analyzed.line.status = line.status;
     nextLines.push(analyzed.line);
     issues.push(...analyzed.issues);
   });
@@ -218,7 +243,7 @@ export function analyzeProject(state: ProjectState): ProjectState {
   return {
     ...state,
     lines: nextLines,
-    issues,
+    issues: preserveIssueResolution(state, issues),
     lastCheckedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };

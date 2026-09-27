@@ -1,5 +1,6 @@
 export type RuleKind = 'letter' | 'number' | 'punctuation' | 'contraction' | 'special';
 export type LineStatus = 'unchecked' | 'reviewed' | 'questionable' | 'approved';
+export type LineRevisionState = 'unchanged' | 'changed' | 'added' | 'restored';
 export type IssueSeverity = 'error' | 'warning' | 'info';
 
 export interface TranscriptionRule {
@@ -34,11 +35,20 @@ export interface BrailleToken {
 export interface TextbookLine {
   id: string;
   source: string;
+  previousSource?: string;
+  revisionState: LineRevisionState;
   tokens: BrailleToken[];
   status: LineStatus;
   note: string;
   continuesPrevious: boolean;
   continuesNext: boolean;
+}
+
+export interface PendingRemovedLine {
+  line: TextbookLine;
+  originalIndex: number;
+  issues: ProofIssue[];
+  removedAt: string;
 }
 
 export interface ProofIssue {
@@ -67,6 +77,7 @@ export interface ProjectState {
   activeRuleSetId: string;
   ruleSets: RuleSet[];
   lines: TextbookLine[];
+  pendingRemovals: PendingRemovedLine[];
   selectedLineId: string;
   issues: ProofIssue[];
   versions: VersionSnapshot[];

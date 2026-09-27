@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { alignLines, splitImportedText } from './lineAlignment';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type { HistoryState, PendingRemovedLine, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -15,6 +16,52 @@ type HistoryAction =
 
 function cloneState(state: ProjectState): ProjectState {
   return structuredClone(state);
+}
+
+function normalizeLine(line: TextbookLine): TextbookLine {
+  return {
+    ...line,
+    tokens: Array.isArray(line.tokens) ? line.tokens : [],
+    note: line.note ?? '',
+    continuesPrevious: line.continuesPrevious ?? false,
+    continuesNext: line.continuesNext ?? false,
+    revisionState: line.revisionState ?? 'unchanged',
+  };
+}
+
+function normalizeProject(state: ProjectState): ProjectState {
+  const lines = Array.isArray(state.lines) ? state.lines.map(normalizeLine) : [];
+  const pendingRemovals = Array.isArray(state.pendingRemovals)
+    ? state.pendingRemovals.map((item: PendingRemovedLine) => ({
+      ...item,
+      line: normalizeLine(item.line),
+      issues: Array.isArray(item.issues) ? item.issues : [],
+    }))
+    : [];
+  const selectedLineExists = lines.some((line) => line.id === state.selectedLineId);
+
+  return {
+    ...state,
+    lines,
+    pendingRemovals,
+    selectedLineId: selectedLineExists ? state.selectedLineId : (lines[0]?.id ?? ''),
+    issues: Array.isArray(state.issues) ? state.issues : [],
+    versions: Array.isArray(state.versions) ? state.versions : [],
+  };
+}
+
+function makeLine(source: string, index: number, prefix = 'line'): TextbookLine {
+  return {
+    id: `${prefix}-${Date.now().toString(36)}-${index}-${Math.random().toString(36).slice(2, 7)}`,
+    source,
+    previousSource: undefined,
+    revisionState: 'added',
+    tokens: [],
+    status: 'unchecked',
+    note: '',
+    continuesPrevious: false,
+    continuesNext: false,
+  };
 }
 
 function historyReducer(state: HistoryState, action: HistoryAction): HistoryState {
@@ -55,7 +102,7 @@ function loadInitialState(): ProjectState {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as ProjectState;
-      return analyzeProject(parsed);
+      return analyzeProject(normalizeProject(parsed));
     }
   } catch {
     // 清除损坏草稿并使用内置示例。
@@ -210,6 +257,13 @@ function RuleSetPanel({
   );
 }
 
+function revisionLabel(line: TextbookLine): string | undefined {
+  if (line.revisionState === 'changed') return '原文已修改 · 回到待复核';
+  if (line.revisionState === 'added') return '新增行 · 已自动转录';
+  if (line.revisionState === 'restored') return '已从待确认区移回';
+  return undefined;
+}
+
 function LineCard({
   line,
   index,
@@ -256,6 +310,19 @@ function LineCard({
             <md-icon-button aria-label="删除此行" title="删除此行" onClick={(event: MouseEvent) => { event.stopPropagation(); onDelete(); }}>×</md-icon-button>
           </div>
         </div>
+        {revisionLabel(line) && <div class={`revision-banner ${line.revisionState}`}>{revisionLabel(line)}</div>}
+        {line.revisionState === 'changed' && line.previousSource !== undefined && (
+          <div class="revision-compare">
+            <div>
+              <span>旧文</span>
+              <p>{line.previousSource || '（空行）'}</p>
+            </div>
+            <div>
+              <span>新文</span>
+              <p>{line.source || '（空行）'}</p>
+            </div>
+          </div>
+        )}
         <div class="braille-preview" aria-label={`第 ${index + 1} 行盲文预览`}>
           {line.tokens.length === 0 && <span class="empty-preview">空行</span>}
           {line.tokens.map((token) => (
@@ -290,6 +357,54 @@ function LineCard({
   );
 }
 
+function statusLabel(status: TextbookLine['status']): string {
+  if (status === 'approved') return '已批准';
+  if (status === 'reviewed') return '已校对';
+  if (status === 'questionable') return '待核对';
+  return '未检查';
+}
+
+function PendingRemovals({
+  pending,
+  onRestore,
+  onConfirm,
+}: {
+  pending: PendingRemovedLine[];
+  onRestore: (lineId: string) => void;
+  onConfirm: (lineId: string) => void;
+}) {
+  if (pending.length === 0) return null;
+
+  return (
+    <section class="pending-panel" aria-label="待确认移除区">
+      <div class="pending-heading">
+        <div>
+          <h2>待确认区</h2>
+          <p>{pending.length} 行暂时未出现在新课文中；移回会恢复状态、备注和问题记录，确认后才永久移出教材。</p>
+        </div>
+      </div>
+      <div class="pending-list">
+        {pending.map(({ line, originalIndex, issues, removedAt }) => (
+          <article class="pending-card" key={line.id}>
+            <div class="pending-meta">
+              <span>原第 {originalIndex + 1} 行</span>
+              <span>{statusLabel(line.status)}</span>
+              <span>{issues.filter((issue) => !issue.resolved).length} 个未处理问题</span>
+              <time>{formatTime(removedAt)}</time>
+            </div>
+            <p>{line.source || '（空行）'}</p>
+            {line.note && <small>备注：{line.note}</small>}
+            <div class="pending-actions">
+              <md-outlined-button onClick={() => onRestore(line.id)}>移回教材</md-outlined-button>
+              <md-filled-tonal-button onClick={() => onConfirm(line.id)}>确认移出</md-filled-tonal-button>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function EditorPanel({
   state,
   onSelectLine,
@@ -300,6 +415,8 @@ function EditorPanel({
   onAddLine,
   onSplitLongLines,
   onImport,
+  onRestorePending,
+  onConfirmPending,
 }: {
   state: ProjectState;
   onSelectLine: (id: string) => void;
@@ -310,6 +427,8 @@ function EditorPanel({
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
+  onRestorePending: (lineId: string) => void;
+  onConfirmPending: (lineId: string) => void;
 }) {
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState('');
@@ -320,10 +439,10 @@ function EditorPanel({
         <div>
           <span class="eyebrow">逐行校对</span>
           <h1>{state.title}</h1>
-          <p>{state.author} · {state.lines.length} 行 · {brailleCellCount(state)} 格</p>
+          <p>{state.author} · {state.lines.length} 行 · {brailleCellCount(state)} 格{state.pendingRemovals.length > 0 && ` · ${state.pendingRemovals.length} 行待确认`}</p>
         </div>
         <div class="toolbar-actions">
-          <md-outlined-button onClick={() => setShowImport((value) => !value)}>导入课文</md-outlined-button>
+          <md-outlined-button onClick={() => setShowImport((value) => !value)}>导入修订版</md-outlined-button>
           <md-outlined-button onClick={onSplitLongLines}>按句拆分</md-outlined-button>
           <md-filled-button onClick={onAddLine}>新增行</md-filled-button>
         </div>
@@ -335,10 +454,11 @@ function EditorPanel({
             type="textarea"
             rows={5}
             value={importText}
-            label="粘贴课文；换行或句末标点将被拆成行"
+            label="粘贴修订版；相同原文沿用校对结果，变化行会显示旧文/新文"
             onInput={(event: any) => setImportText(event.currentTarget.value)}
           />
           <div>
+            <small class="import-help">逐行核对：未变行保留状态/备注/问题；新增行自动转录；移除行进入待确认区。</small>
             <md-text-button onClick={() => { setImportText(''); setShowImport(false); }}>取消</md-text-button>
             <md-filled-button
               disabled={!importText.trim()}
@@ -348,7 +468,7 @@ function EditorPanel({
                 setShowImport(false);
               }}
             >
-              替换并重新转录
+              逐行核对并导入
             </md-filled-button>
           </div>
         </div>
@@ -369,6 +489,11 @@ function EditorPanel({
             onDelete={() => onDelete(line.id)}
           />
         ))}
+        <PendingRemovals
+          pending={state.pendingRemovals}
+          onRestore={onRestorePending}
+          onConfirm={onConfirmPending}
+        />
       </div>
     </main>
   );
@@ -469,7 +594,11 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
             <div>
               <strong>{version.name}</strong>
               <p>{version.action} · {formatTime(version.createdAt)}</p>
-              <div class="metric-row"><span>{version.snapshot.lines.length} 行</span><span>{version.snapshot.issues.filter((issue) => !issue.resolved).length} 个未处理问题</span></div>
+              <div class="metric-row">
+                <span>{version.snapshot.lines.length} 行</span>
+                <span>{version.snapshot.issues.filter((issue) => !issue.resolved).length} 个未处理问题</span>
+                {version.snapshot.pendingRemovals.length > 0 && <span>{version.snapshot.pendingRemovals.length} 行待确认</span>}
+              </div>
               <md-text-button onClick={() => onRestore(version)}>恢复此版本</md-text-button>
             </div>
           </div>
@@ -600,17 +729,102 @@ export default function App() {
   };
 
   const importCourse = (text: string) => {
-    const sourceLines = text
-      .replace(/\r/g, '')
-      .split(/\n+|(?<=[.!?。！？])\s+/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-    commit('导入课文', (current) => analyzeProject({
-      ...current,
-      lines: sourceLines.map((source, index) => ({ id: `line-import-${Date.now()}-${index}`, source, tokens: [], status: index === 0 ? 'questionable' : 'unchecked', note: index === 0 ? '导入后待确认规则集。' : '', continuesPrevious: false, continuesNext: false })),
-      selectedLineId: '',
-      issues: [],
-    }));
+    const incomingSources = splitImportedText(text);
+    if (incomingSources.length === 0) return;
+
+    commit('逐行核对导入修订版', (current) => {
+      const removedAt = new Date().toISOString();
+      const substantiveLines = current.lines.filter((line) => line.source.trim().length > 0);
+      const issuesByLine = new Map<string, ProofIssue[]>();
+      current.issues.forEach((item) => {
+        issuesByLine.set(item.lineId, [...(issuesByLine.get(item.lineId) ?? []), item]);
+      });
+
+      const pendingPool = new Map<string, PendingRemovedLine[]>();
+      current.pendingRemovals.forEach((item) => {
+        pendingPool.set(item.line.source, [...(pendingPool.get(item.line.source) ?? []), item]);
+      });
+      const takePending = (source: string): PendingRemovedLine | undefined => pendingPool.get(source)?.shift();
+
+      const nextLines: TextbookLine[] = [];
+      const nextPending: PendingRemovedLine[] = [];
+      const carriedIssues: ProofIssue[] = [];
+      let addedIndex = 0;
+
+      alignLines(substantiveLines, incomingSources).forEach((entry) => {
+        if (entry.kind === 'equal' && entry.oldLine) {
+          nextLines.push({ ...entry.oldLine, previousSource: undefined, revisionState: 'unchanged', tokens: [] });
+          carriedIssues.push(...(issuesByLine.get(entry.oldLine.id) ?? []));
+          return;
+        }
+
+        if (entry.kind === 'replace' && entry.oldLine && entry.newSource !== undefined) {
+          const restored = takePending(entry.newSource);
+          if (restored) {
+            const originalIndex = current.lines.findIndex((line) => line.id === entry.oldLine!.id);
+            nextPending.push({
+              line: { ...entry.oldLine, previousSource: undefined, revisionState: 'unchanged' },
+              originalIndex: originalIndex === -1 ? nextPending.length : originalIndex,
+              issues: issuesByLine.get(entry.oldLine.id) ?? [],
+              removedAt,
+            });
+            nextLines.push({ ...restored.line, previousSource: undefined, revisionState: 'restored', tokens: [] });
+            carriedIssues.push(...restored.issues);
+          } else {
+            nextLines.push({
+              ...entry.oldLine,
+              source: entry.newSource,
+              previousSource: entry.oldLine.source,
+              revisionState: 'changed',
+              tokens: [],
+              status: 'questionable',
+              continuesPrevious: false,
+              continuesNext: false,
+            });
+          }
+          return;
+        }
+
+        if (entry.kind === 'insert' && entry.newSource !== undefined) {
+          const restored = takePending(entry.newSource);
+          if (restored) {
+            nextLines.push({ ...restored.line, previousSource: undefined, revisionState: 'restored', tokens: [] });
+            carriedIssues.push(...restored.issues);
+          } else {
+            nextLines.push(makeLine(entry.newSource, addedIndex, 'line-import'));
+          }
+          addedIndex += 1;
+          return;
+        }
+
+        if (entry.kind === 'remove' && entry.oldLine) {
+          const originalIndex = current.lines.findIndex((line) => line.id === entry.oldLine!.id);
+          nextPending.push({
+            line: { ...entry.oldLine, previousSource: undefined, revisionState: 'unchanged' },
+            originalIndex: originalIndex === -1 ? nextPending.length : originalIndex,
+            issues: issuesByLine.get(entry.oldLine.id) ?? [],
+            removedAt,
+          });
+        }
+      });
+
+      pendingPool.forEach((items) => nextPending.push(...items));
+
+      const selectedLineId = nextLines.find((line) => line.revisionState === 'changed')?.id
+        ?? nextLines.find((line) => line.revisionState === 'added')?.id
+        ?? nextLines[0]?.id
+        ?? '';
+      const beforeImportVersion = createSnapshot('导入修订版前', current);
+
+      return analyzeProject({
+        ...current,
+        lines: nextLines,
+        pendingRemovals: nextPending,
+        selectedLineId,
+        issues: carriedIssues,
+        versions: [beforeImportVersion, ...current.versions].slice(0, 20),
+      });
+    });
   };
 
   return (
@@ -647,7 +861,7 @@ export default function App() {
       <div class="workspace-grid">
         <RuleSetPanel
           state={state}
-          onSelect={(id) => commit('切换规则集并重新检查', (current) => analyzeProject({ ...current, activeRuleSetId: id, issues: [] }))}
+          onSelect={(id) => commit('切换规则集并重新检查', (current) => analyzeProject({ ...current, activeRuleSetId: id }))}
           onUpdateRule={updateRule}
           onToggleContractions={() => {
             const ruleSet = activeRuleSet;
@@ -670,20 +884,52 @@ export default function App() {
           onStatus={changeStatus}
           onDelete={(lineId) => commit('删除课文行', (current) => {
             const lines = current.lines.filter((line) => line.id !== lineId);
-            return analyzeProject({ ...current, lines: lines.length ? lines : [{ id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false }], selectedLineId: lines[0]?.id ?? '' });
+            const fallback = makeLine('', 0);
+            const nextLines = lines.length ? lines : [fallback];
+            return analyzeProject({ ...current, lines: nextLines, selectedLineId: lines.find((line) => line.id === current.selectedLineId)?.id ?? lines[0]?.id ?? fallback.id });
           })}
           onAddLine={() => commit('新增课文行', (current) => {
-            const line: TextbookLine = { id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false };
+            const line = makeLine('', current.lines.length);
             return analyzeProject({ ...current, lines: [...current.lines, line], selectedLineId: line.id });
           })}
           onSplitLongLines={() => commit('按句拆分长行', (current) => {
             const lines = current.lines.flatMap((line) => line.source
               .split(/(?<=[.!?。！？])\s+|;\s*/)
               .filter((part) => part.trim())
-              .map((source, index) => ({ ...line, id: index === 0 ? line.id : `line-split-${Date.now()}-${index}`, source: source.trim(), tokens: [], note: index === 0 ? line.note : '' })));
+              .map((source, index) => ({
+                ...line,
+                id: index === 0 ? line.id : `line-split-${Date.now()}-${index}`,
+                source: source.trim(),
+                tokens: [],
+                revisionState: index === 0 ? line.revisionState : 'added',
+                previousSource: index === 0 ? line.previousSource : undefined,
+                status: index === 0 ? line.status : 'unchecked',
+                note: index === 0 ? line.note : '',
+              })));
             return analyzeProject({ ...current, lines });
           })}
           onImport={importCourse}
+          onRestorePending={(lineId) => commit('从待确认区移回课文行', (current) => {
+            const item = current.pendingRemovals.find((pending) => pending.line.id === lineId);
+            if (!item) return current;
+            const restoredLine = { ...item.line, revisionState: 'restored' as const, previousSource: undefined, tokens: [] };
+            const insertAt = Math.min(item.originalIndex, current.lines.length);
+            const lines = [...current.lines.slice(0, insertAt), restoredLine, ...current.lines.slice(insertAt)];
+            const knownIssueIds = new Set(current.issues.map((issue) => issue.id));
+            const restoredIssues = item.issues.filter((issue) => !knownIssueIds.has(issue.id));
+            return analyzeProject({
+              ...current,
+              lines,
+              pendingRemovals: current.pendingRemovals.filter((pending) => pending.line.id !== lineId),
+              selectedLineId: restoredLine.id,
+              issues: [...current.issues, ...restoredIssues],
+            });
+          })}
+          onConfirmPending={(lineId) => commit('确认移出课文行', (current) => {
+            const nextPending = current.pendingRemovals.filter((pending) => pending.line.id !== lineId);
+            const selectedLineId = current.selectedLineId === lineId ? (current.lines[0]?.id ?? '') : current.selectedLineId;
+            return { ...current, pendingRemovals: nextPending, selectedLineId, updatedAt: new Date().toISOString() };
+          })}
         />
 
         <aside class="right-panel">
@@ -708,7 +954,7 @@ export default function App() {
             }));
           }} />}
           {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
-            const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
+            const restored: ProjectState = normalizeProject(cloneState({ ...version.snapshot, versions: state.versions }));
             restore(restored);
           }} />}
         </aside>
