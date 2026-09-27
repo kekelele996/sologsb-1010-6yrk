@@ -39,6 +39,18 @@ export interface TextbookLine {
   note: string;
   continuesPrevious: boolean;
   continuesNext: boolean;
+  /** 修订导入前的旧原文，用于新旧对照；教师采纳新文后清除。 */
+  previousSource?: string;
+}
+
+export interface RemovedLine {
+  id: string;
+  line: TextbookLine;
+  /** 移除前在课文中的位置，恢复时插回附近。 */
+  index: number;
+  removedAt: string;
+  /** 移除时该行的问题处理记录快照，恢复时用于还原已处理标记。 */
+  issues: ProofIssue[];
 }
 
 export interface ProofIssue {
@@ -67,6 +79,7 @@ export interface ProjectState {
   activeRuleSetId: string;
   ruleSets: RuleSet[];
   lines: TextbookLine[];
+  removedLines: RemovedLine[];
   selectedLineId: string;
   issues: ProofIssue[];
   versions: VersionSnapshot[];

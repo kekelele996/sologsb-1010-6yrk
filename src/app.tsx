@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { analyzeProject, brailleCellCount, carryResolvedIssues, makeRule, mergeImportedLines, outputText, updateRuleInSet } from './braille';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type { HistoryState, LineStatus, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -55,7 +55,8 @@ function loadInitialState(): ProjectState {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as ProjectState;
-      return analyzeProject(parsed);
+      // 兼容旧草稿：待确认移除区是后加的字段。
+      return analyzeProject({ ...parsed, removedLines: parsed.removedLines ?? [] });
     }
   } catch {
     // 清除损坏草稿并使用内置示例。
@@ -91,6 +92,10 @@ function issueLabel(issue: ProofIssue): string {
   if (issue.severity === 'error') return '阻断';
   if (issue.severity === 'warning') return '可疑';
   return '建议';
+}
+
+function statusLabel(status: LineStatus): string {
+  return { unchecked: '未检查', questionable: '待核对', reviewed: '已校对', approved: '已批准' }[status];
 }
 
 function Section({ title, subtitle, action, children }: { title: string; subtitle?: string; action?: ComponentChildren; children: ComponentChildren }) {
@@ -220,6 +225,7 @@ function LineCard({
   onNote,
   onStatus,
   onDelete,
+  onAcceptRevision,
 }: {
   line: TextbookLine;
   index: number;
@@ -230,15 +236,17 @@ function LineCard({
   onNote: (note: string) => void;
   onStatus: (status: TextbookLine['status']) => void;
   onDelete: () => void;
+  onAcceptRevision: () => void;
 }) {
   const unresolved = issues.filter((issue) => !issue.resolved);
   const lineIssues = unresolved.filter((issue) => issue.lineId === line.id);
+  const showRevisionDiff = line.previousSource !== undefined && line.previousSource !== line.source;
 
   return (
     <article class={`line-card ${selected ? 'selected' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
       <div class="line-gutter">
         <span>{String(index + 1).padStart(2, '0')}</span>
-        <span class={`line-status ${line.status}`} title={`状态：${line.status}`} />
+        <span class={`line-status ${line.status}`} title={`状态：${statusLabel(line.status)}`} />
       </div>
       <div class="line-body">
         <div class="line-source">
@@ -256,6 +264,13 @@ function LineCard({
             <md-icon-button aria-label="删除此行" title="删除此行" onClick={(event: MouseEvent) => { event.stopPropagation(); onDelete(); }}>×</md-icon-button>
           </div>
         </div>
+        {showRevisionDiff && (
+          <div class="diff-block" aria-label={`第 ${index + 1} 行修订对照`}>
+            <div class="diff-row old"><span class="diff-tag">旧文</span><del>{line.previousSource}</del></div>
+            <div class="diff-row new"><span class="diff-tag">新文</span><span>{line.source}</span></div>
+            <md-text-button onClick={(event: MouseEvent) => { event.stopPropagation(); onAcceptRevision(); }}>已核对，采纳新文</md-text-button>
+          </div>
+        )}
         <div class="braille-preview" aria-label={`第 ${index + 1} 行盲文预览`}>
           {line.tokens.length === 0 && <span class="empty-preview">空行</span>}
           {line.tokens.map((token) => (
@@ -300,6 +315,10 @@ function EditorPanel({
   onAddLine,
   onSplitLongLines,
   onImport,
+  onAcceptRevision,
+  onRestoreRemoved,
+  onConfirmRemoved,
+  onConfirmAllRemoved,
 }: {
   state: ProjectState;
   onSelectLine: (id: string) => void;
@@ -310,6 +329,10 @@ function EditorPanel({
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
+  onAcceptRevision: (id: string) => void;
+  onRestoreRemoved: (id: string) => void;
+  onConfirmRemoved: (id: string) => void;
+  onConfirmAllRemoved: () => void;
 }) {
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState('');
@@ -335,7 +358,7 @@ function EditorPanel({
             type="textarea"
             rows={5}
             value={importText}
-            label="粘贴课文；换行或句末标点将被拆成行"
+            label="粘贴修订版课文；将与现有内容逐行核对合并，已校对成果不会丢失"
             onInput={(event: any) => setImportText(event.currentTarget.value)}
           />
           <div>
@@ -348,7 +371,7 @@ function EditorPanel({
                 setShowImport(false);
               }}
             >
-              替换并重新转录
+              逐行核对导入
             </md-filled-button>
           </div>
         </div>
@@ -367,8 +390,37 @@ function EditorPanel({
             onNote={(note) => onNote(line.id, note)}
             onStatus={(status) => onStatus(line.id, status)}
             onDelete={() => onDelete(line.id)}
+            onAcceptRevision={() => onAcceptRevision(line.id)}
           />
         ))}
+
+        {state.removedLines.length > 0 && (
+          <section class="removed-area" aria-label="待确认移除的行">
+            <div class="removed-head">
+              <div>
+                <strong>待确认移除 · {state.removedLines.length} 行</strong>
+                <p>修订版课文中已没有这些行；确认后才会移出教材，也可以先恢复回去。</p>
+              </div>
+              <md-text-button onClick={onConfirmAllRemoved}>全部确认移出</md-text-button>
+            </div>
+            {state.removedLines.map((item) => (
+              <div class="removed-row" key={item.id}>
+                <div class="removed-info">
+                  <del>{item.line.source || '（空行）'}</del>
+                  <small>
+                    原状态：{statusLabel(item.line.status)}
+                    {item.line.note ? ` · 备注：${item.line.note}` : ''}
+                    {item.issues.filter((issue) => !issue.resolved).length > 0 ? ` · ${item.issues.filter((issue) => !issue.resolved).length} 个未处理问题` : ''}
+                  </small>
+                </div>
+                <div class="removed-actions">
+                  <md-text-button onClick={() => onRestoreRemoved(item.id)}>恢复回教材</md-text-button>
+                  <md-icon-button aria-label="确认移出教材" title="确认移出教材" onClick={() => onConfirmRemoved(item.id)}>×</md-icon-button>
+                </div>
+              </div>
+            ))}
+          </section>
+        )}
       </div>
     </main>
   );
@@ -496,12 +548,17 @@ export default function App() {
   };
 
   const changeLine = (lineId: string, source: string) => {
-    commit('修改课文原文', (current) => analyzeProject({ ...current, lines: current.lines.map((line) => line.id === lineId ? { ...line, source } : line) }));
+    commit('修改课文原文', (current) => analyzeProject({
+      ...current,
+      lines: current.lines.map((line) => line.id === lineId ? { ...line, source, previousSource: undefined } : line),
+    }));
   };
 
   const changeStatus = (lineId: string, status: TextbookLine['status']) => {
     commit('更新校对状态', (current) => {
-      const lines = current.lines.map((line) => line.id === lineId ? { ...line, status } : line);
+      const lines = current.lines.map((line) => line.id === lineId
+        ? { ...line, status, previousSource: status === 'reviewed' || status === 'approved' ? undefined : line.previousSource }
+        : line);
       const issues = current.issues.map((item) => item.lineId === lineId && status === 'approved' ? { ...item, resolved: true } : item);
       return { ...current, lines, issues, updatedAt: new Date().toISOString() };
     });
@@ -605,12 +662,56 @@ export default function App() {
       .split(/\n+|(?<=[.!?。！？])\s+/)
       .map((line) => line.trim())
       .filter(Boolean);
-    commit('导入课文', (current) => analyzeProject({
+    commit('导入修订版课文', (current) => {
+      const merged = mergeImportedLines(current.lines, sourceLines);
+      // 导入前自动留一个版本快照，整个过程可撤销、可恢复。
+      const backup = createSnapshot('导入前自动备份', current);
+      const removedWithIssues = merged.removed.map((item) => ({
+        ...item,
+        issues: current.issues.filter((issue) => issue.lineId === item.line.id),
+      }));
+      const analyzed = analyzeProject({
+        ...current,
+        lines: merged.lines,
+        removedLines: [...removedWithIssues, ...current.removedLines],
+        versions: [backup, ...current.versions].slice(0, 20),
+        selectedLineId: merged.lines[0]?.id ?? '',
+      });
+      // 原文未变的行沿用原问题处理记录。
+      return { ...analyzed, issues: carryResolvedIssues(current.issues, analyzed.issues, new Set(merged.preservedLineIds)) };
+    });
+  };
+
+  const acceptRevision = (lineId: string) => {
+    commit('采纳修订行', (current) => ({
       ...current,
-      lines: sourceLines.map((source, index) => ({ id: `line-import-${Date.now()}-${index}`, source, tokens: [], status: index === 0 ? 'questionable' : 'unchecked', note: index === 0 ? '导入后待确认规则集。' : '', continuesPrevious: false, continuesNext: false })),
-      selectedLineId: '',
-      issues: [],
+      lines: current.lines.map((line) => line.id === lineId ? { ...line, previousSource: undefined } : line),
     }));
+  };
+
+  const restoreRemoved = (removedId: string) => {
+    commit('恢复被移除的行', (current) => {
+      const item = current.removedLines.find((entry) => entry.id === removedId);
+      if (!item) return current;
+      const lines = [...current.lines];
+      lines.splice(Math.min(item.index, lines.length), 0, item.line);
+      const analyzed = analyzeProject({
+        ...current,
+        lines,
+        removedLines: current.removedLines.filter((entry) => entry.id !== removedId),
+        selectedLineId: item.line.id,
+      });
+      // 恢复时带回移除前已处理的问题记录。
+      return { ...analyzed, issues: carryResolvedIssues(item.issues, analyzed.issues, new Set([item.line.id])) };
+    });
+  };
+
+  const confirmRemoved = (removedId: string) => {
+    commit('确认移出教材', (current) => ({ ...current, removedLines: current.removedLines.filter((entry) => entry.id !== removedId) }));
+  };
+
+  const confirmAllRemoved = () => {
+    commit('确认全部移出教材', (current) => (current.removedLines.length ? { ...current, removedLines: [] } : current));
   };
 
   return (
@@ -640,6 +741,7 @@ export default function App() {
         </div>
         <div class="status-stat warning"><strong>{unresolvedCount}</strong><span>未处理问题</span></div>
         <div class="status-stat"><strong>{state.lines.filter((line) => line.status === 'questionable').length}</strong><span>待核对行</span></div>
+        <div class={`status-stat ${state.removedLines.length > 0 ? 'warning' : ''}`}><strong>{state.removedLines.length}</strong><span>待确认移除</span></div>
         <div class="status-stat"><strong>{activeRuleSet.rules.filter((rule) => rule.enabled).length}</strong><span>启用规则</span></div>
         <div class="shortcut-hint">快捷键：⌘/Ctrl Z 撤销 · ⇧⌘/Ctrl Z 重做 · ⌘/Ctrl Enter 批准并下一行 · J/K 切换行</div>
       </div>
@@ -684,6 +786,10 @@ export default function App() {
             return analyzeProject({ ...current, lines });
           })}
           onImport={importCourse}
+          onAcceptRevision={acceptRevision}
+          onRestoreRemoved={restoreRemoved}
+          onConfirmRemoved={confirmRemoved}
+          onConfirmAllRemoved={confirmAllRemoved}
         />
 
         <aside class="right-panel">

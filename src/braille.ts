@@ -2,6 +2,7 @@ import type {
   BrailleToken,
   ProofIssue,
   ProjectState,
+  RemovedLine,
   RuleSet,
   TextbookLine,
   TranscriptionRule,
@@ -229,6 +230,139 @@ export function updateRuleInSet(ruleSet: RuleSet, ruleId: string, patch: Partial
     ...ruleSet,
     rules: ruleSet.rules.map((rule) => (rule.id === ruleId ? { ...rule, ...patch } : rule)),
   };
+}
+
+type DiffOp =
+  | { type: 'equal'; oldIndex: number }
+  | { type: 'remove'; oldIndex: number }
+  | { type: 'add'; newIndex: number };
+
+/** 基于 LCS 的逐行 diff，按原文完全匹配对齐新旧两批行。 */
+function diffSources(oldSources: string[], newSources: string[]): DiffOp[] {
+  const rows = oldSources.length;
+  const cols = newSources.length;
+  const dp: number[][] = Array.from({ length: rows + 1 }, () => new Array<number>(cols + 1).fill(0));
+  for (let i = rows - 1; i >= 0; i -= 1) {
+    for (let j = cols - 1; j >= 0; j -= 1) {
+      dp[i][j] = oldSources[i] === newSources[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const ops: DiffOp[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < rows && j < cols) {
+    if (oldSources[i] === newSources[j]) {
+      ops.push({ type: 'equal', oldIndex: i });
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      ops.push({ type: 'remove', oldIndex: i });
+      i += 1;
+    } else {
+      ops.push({ type: 'add', newIndex: j });
+      j += 1;
+    }
+  }
+  while (i < rows) ops.push({ type: 'remove', oldIndex: i++ });
+  while (j < cols) ops.push({ type: 'add', newIndex: j++ });
+  return ops;
+}
+
+export interface ImportMergeResult {
+  lines: TextbookLine[];
+  removed: RemovedLine[];
+  /** 原文未变的行 id，这些行的状态、备注和问题处理记录全部沿用。 */
+  preservedLineIds: string[];
+}
+
+function wordsOf(text: string): Set<string> {
+  return new Set(text.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
+}
+
+/** 词级 Jaccard 相似度，用于判断“删一行 + 增一行”是否其实是同一行被修改。 */
+function lineSimilarity(a: string, b: string): number {
+  const wordsA = wordsOf(a);
+  const wordsB = wordsOf(b);
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  let shared = 0;
+  wordsA.forEach((word) => { if (wordsB.has(word)) shared += 1; });
+  return shared / (wordsA.size + wordsB.size - shared);
+}
+
+/** 低于该相似度的删/增对不视为修改，避免把无关的移除行和新增行错误配对。 */
+const REVISION_SIMILARITY = 0.3;
+
+/**
+ * 把修订版课文逐行合并进现有教材：
+ * - 原文相同的行原样保留（状态、备注、问题记录不动）；
+ * - 相邻且足够相似的“删一行 + 增一行”视为同一行被修改：保留行 id 和备注，状态回到待核对，并记录旧原文用于对照；
+ * - 纯新增行生成待检查的新行；
+ * - 纯被移除的行进入待确认区，确认前不移出教材。
+ */
+export function mergeImportedLines(oldLines: TextbookLine[], newSources: string[]): ImportMergeResult {
+  const ops = diffSources(oldLines.map((line) => line.source), newSources);
+  const lines: TextbookLine[] = [];
+  const removed: RemovedLine[] = [];
+  const preservedLineIds: string[] = [];
+  let pendingRemovals: number[] = [];
+  let pendingAdds: number[] = [];
+
+  const flushBlock = () => {
+    const pairedSlots = new Set<number>();
+    for (const newIndex of pendingAdds) {
+      const source = newSources[newIndex];
+      let bestSlot = -1;
+      let bestScore = 0;
+      pendingRemovals.forEach((oldIndex, slot) => {
+        if (pairedSlots.has(slot)) return;
+        const score = lineSimilarity(oldLines[oldIndex].source, source);
+        if (score > bestScore) {
+          bestSlot = slot;
+          bestScore = score;
+        }
+      });
+      if (bestSlot >= 0 && bestScore >= REVISION_SIMILARITY) {
+        pairedSlots.add(bestSlot);
+        const old = oldLines[pendingRemovals[bestSlot]];
+        lines.push({ ...old, source, status: 'questionable', previousSource: old.source });
+      } else {
+        lines.push({ id: uid('line'), source, tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false });
+      }
+    }
+    pendingRemovals.forEach((oldIndex, slot) => {
+      if (!pairedSlots.has(slot)) {
+        removed.push({ id: uid('removed'), line: oldLines[oldIndex], index: oldIndex, removedAt: new Date().toISOString(), issues: [] });
+      }
+    });
+    pendingRemovals = [];
+    pendingAdds = [];
+  };
+
+  for (const op of ops) {
+    if (op.type === 'remove') {
+      pendingRemovals.push(op.oldIndex);
+      continue;
+    }
+    if (op.type === 'add') {
+      pendingAdds.push(op.newIndex);
+      continue;
+    }
+    flushBlock();
+    const old = oldLines[op.oldIndex];
+    preservedLineIds.push(old.id);
+    lines.push(old);
+  }
+  flushBlock();
+  return { lines, removed, preservedLineIds };
+}
+
+/** 重新分析后，把指定行里内容未变的问题恢复为“已处理”，避免丢失问题处理记录。 */
+export function carryResolvedIssues(previous: ProofIssue[], next: ProofIssue[], lineIds: Set<string>): ProofIssue[] {
+  const resolvedKeys = new Set(
+    previous.filter((item) => item.resolved && lineIds.has(item.lineId)).map((item) => `${item.lineId}|${item.code}|${item.message}`),
+  );
+  if (resolvedKeys.size === 0) return next;
+  return next.map((item) => (resolvedKeys.has(`${item.lineId}|${item.code}|${item.message}`) ? { ...item, resolved: true } : item));
 }
 
 export function makeRule(source: string, output: string, suspicious: boolean, kind: TranscriptionRule['kind'] = 'contraction'): TranscriptionRule {
